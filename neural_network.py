@@ -79,8 +79,9 @@ class CharRNN:
         return torch.from_numpy(one_hot)
 
     def train(self, char, timegap):
-        if (char not in self.charset):
-            raise ValueError("Illegal char '{}' ({}) not in charset".format(char, ord(char)))
+        if char is None:
+            self.states = [torch.zeros(self.hidden_size)]  # reset
+            return 1
 
         if len(self.states) < self.truncate_length:
             output, hidden = self.rnn(self._char_to_one_hot(char), self.states[-1])
@@ -102,7 +103,7 @@ class CharRNN:
         for p in self.rnn.parameters():
             p.data.add_(-self.learning_rate, p.grad.data)
 
-        return loss
+        return output.item(), target.item(), loss.item()
 
     def eval(self, charseq):
         with torch.no_grad():

@@ -35,43 +35,51 @@ class WebsocketHandler:
 
     async def handle(self, websocket, path):
         timestamp = None
-        parser_factory = Producer(websocket, path, self.model, self.num_lines, self.num_candidates)
+        parser_factory = Producer(websocket, path, self.model, self.num_candidates)
+        producer_task = None
         async for message in websocket:
             decoded = json.loads(message)
 
-            if decoded["request"] < self.producer_threshold:
-                asyncio.ensure_future(parser_factory.produce())
+            if decoded["char"] is None:
+                producer_task = asyncio.create_task(parser_factory.produce(self.num_lines * 2))
+                self.model.train(None, None)
+            elif decoded["request"] < self.producer_threshold and producer_task.done():
+                producer_task = asyncio.create_task(parser_factory.produce(self.num_lines))
 
-            if not timestamp:
-                new_timestamp = decoded["time"]
-                self.model.train(decoded["char"], None)
-            else:
-                new_timestamp = decoded["time"]
-                print(self.model.train(decoded["char"], (new_timestamp - timestamp) / 1000.0))
-            timestamp = new_timestamp
+            if decoded["char"]:
+                if not timestamp:
+                    new_timestamp = decoded["time"]
+                    self.model.train(decoded["char"], None)
+                else:
+                    new_timestamp = decoded["time"]
+                    output, target, loss = self.model.train(decoded["char"], (new_timestamp - timestamp) / 1000.0)
+                    print("char: {}\t\toutput: {:5.3f}\t\ttarget: {:5.3f}\t\tMSE loss: {:5.3f}".format(decoded["char"], output, target, loss))
+                timestamp = new_timestamp
 
 class Producer:
-    def __init__(self, websocket, path, model, num_lines, num_candidates):
+    def __init__(self, websocket, path, model, num_candidates):
         self.websocket = websocket
         self.path = path
         self.model = model
-        self.num_lines = num_lines
+        self.num_candidates = num_candidates
 
         self.factory = Factory().get_candidates(count=num_candidates)
 
-    async def produce(self):
+    async def produce(self, num_lines):
+        print("Producing {} new lines based on {} candidates...".format(num_lines, num_lines * self.num_candidates))
         lines = []
         while True:
             for strings in self.factory:
                 times = list(map(self.model.eval, strings))
                 best = strings[times.index(max(times))]
                 lines.append(best)
-                if len(lines) == self.num_lines:
+                if len(lines) == num_lines:
                     break
-            if len(lines) == self.num_lines:
+            if len(lines) == num_lines:
                 break
             self.factory = Factory().get_candidates(count=self.num_candidates)
         await self.websocket.send("\n".join(lines))
+        await asyncio.sleep(1)
 
 def main():
     model = CharRNN(charset=tuple(map(chr, range(128))),
@@ -84,6 +92,7 @@ def main():
     handler = WebsocketHandler(model, producer_threshold=10, num_lines=10, num_candidates=50)
     start_server = websockets.serve(handler.handle, '127.0.0.1', 5678)
     asyncio.get_event_loop().run_until_complete(start_server)
+    print("started server")
     asyncio.get_event_loop().run_forever()
 
 if __name__ == "__main__":
