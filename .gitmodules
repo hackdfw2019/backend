@@ -1,3 +1,6 @@
 [submodule "parser"]
 	path = parser
 	url = git@github.com:hackdfw2019/parser.git
+[submodule "parser2"]
+	path = parser2
+	url = git@github.com:hackdfw2019/parser2.git

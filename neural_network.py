@@ -27,7 +27,7 @@ class RectifiedLogisticCurve(nn.Module):
         result = (v_inv_2 * torch.pow(torch.exp(x * -self.growth_value) + 1, -v_inv) - 1) / (v_inv_2 - 1)
         return F.threshold(result, 0, 0)
 
-class CharRNN(nn.Module):
+class CharRNNCell(nn.Module):
     def __init__(self, input_size, hidden_size, output_activation):
         super().__init__()
 
@@ -45,12 +45,11 @@ class CharRNN(nn.Module):
         input_combined = torch.cat((hidden, input_))
         return self.output_layer(input_combined), self.hidden_layer(input_combined)
 
-class CharRNNTrainer(Thread):
+class CharRNN:
     """
-    Asynchronously trains a CharRNN, taking characters and timestamps from a Queue
+    Has the ability to train the network if fed one character at a time, as well as evaluate on a sequence of characters
 
     Args:
-        char_queue (Queue): queue to poll from, containing tuples of the form (char: string, timestamp: float)
         charset (iterable): charset to use, also determines size of input vectors to RNN
         hidden_size (int): number of dimensions in hidden layer
         learning_rate (float): learning rate per time step
@@ -59,54 +58,59 @@ class CharRNNTrainer(Thread):
         values into the range (0, 1), see https://www.desmos.com/calculator/grilveheq
     """
 
-    def __init__(self, char_queue, charset, hidden_size, learning_rate, truncate_length,
+    def __init__(self, charset, hidden_size, learning_rate, truncate_length,
                  time_logistic_growth_constant, time_logistic_inflection_constant):
         super().__init__()
-        self.char_queue = char_queue
         self.charset = charset
         self.charmap = {x: i for i, x in enumerate(charset)}  # maps char values to indices
+        self.hidden_size = hidden_size
         self.learning_rate = learning_rate
+        self.truncate_length = truncate_length
 
         self.time_curve = RectifiedLogisticCurve(time_logistic_growth_constant, time_logistic_inflection_constant)
-        self.rnn = CharRNN(len(self.charset), hidden_size, self.time_curve)
+        self.rnn = CharRNNCell(len(self.charset), hidden_size, self.time_curve)
         self.criterion = nn.MSELoss()
 
         self.states = [torch.zeros(hidden_size)]  # use zero-initialization for hidden layer
 
-    def char_to_one_hot(self, char):
+    def _char_to_one_hot(self, char):
         one_hot = np.zeros(len(self.charset), dtype=np.float32)
         one_hot[self.charmap[char]] = 1
         return torch.from_numpy(one_hot)
 
-    def run(self):
-        # don't train on first character, just feed through network to get initial hidden state
-        char, timestamp = self.char_queue.get()
+    def train(self, char, timegap):
         if (char not in self.charset):
             raise ValueError("Illegal char '{}' ({}) not in charset".format(char, ord(char)))
-        _, hidden = self.rnn(self.char_to_one_hot(char), self.states[-1])
-        self.states.append(hidden)
 
-        while True:
-            char, new_timestamp = self.char_queue.get()
-            if (char not in self.charset):
-                raise ValueError("Illegal char '{}' ({}) not in charset".format(char, ord(char)))
+        if len(self.states) < self.truncate_length:
+            output, hidden = self.rnn(self._char_to_one_hot(char), self.states[-1])
+            self.states.append(hidden)
+            # don't train on first character, just feed through network to get initial hidden state
+            if len(self.states) == 2:
+                return 1
+        else:
+            # do some sketch shit
+            for curr, next_ in zip(self.states, self.states[1:]):
+                curr.data = next_.data
+            output, self.states[-1] = self.rnn(self._char_to_one_hot(char), self.states[-2])
 
+        target = self.time_curve(torch.tensor(timegap))
+        loss = self.criterion(output, target)
 
-            if len(self.states) < self.truncate_length:
-                output, hidden = self.rnn(self.char_to_one_hot(char), self.states[-1])
-                self.states.append(hidden)
-            else:
-                # do some sketch shit
-                for curr, next_ in zip(self.states, self.states[1:]):
-                    curr.data = next_.data
-                output, self.states[-1] = self.rnn(self.char_to_one_hot(char), self.states[-2])
+        self.rnn.zero_grad()
+        loss.backward(retain_graph=True)
+        for p in self.rnn.parameters():
+            p.data.add_(-self.learning_rate, p.grad.data)
 
-            target = self.time_curve(torch.tensor(new_timestamp - timestamp))
-            loss = self.criterion(output, target)
+        return loss
 
-            self.rnn.zero_grad()
-            loss.backward(retain_graph=True)
-            for p in self.rnn.parameters():
-                p.data.add_(-self.learning_rate, p.grad.data)
+    def eval(self, charseq):
+        with torch.no_grad():
+            # ignore output from first char
+            _, hidden = self.rnn(self._char_to_one_hot(charseq[0]), torch.zeros(self.hidden_size))  # 0-initialize hidden state
 
-            timestamp = new_timestamp
+            total_time = 0
+            for char in charseq[1:]:
+                output, hidden = self.rnn(self._char_to_one_hot(char), hidden)
+                total_time += output.item()
+        return total_time
